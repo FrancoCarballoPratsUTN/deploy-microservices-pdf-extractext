@@ -2,7 +2,8 @@
 #
 # Topología: traefik-public (80/443, TLS) + traefik-internal (:8443, HTTP
 # plano, sin puertos publicados), red edge + red backend (internal). Consul
-# corre solo en backend (container_name: consul), sin puertos publicados.
+# corre solo en backend (container_name: consul); su UI/API se publica
+# únicamente en loopback (127.0.0.1:8501), nunca en la red.
 #
 # CONSUL_ENABLED es una variable de entorno del proceso fijada a "true" en los
 # servicios; la configuración funcional vive en Consul KV (deploy/kv/*).
@@ -32,7 +33,7 @@ CONSUL_LOCAL_URL ?= https://127.0.0.1:8501
 -include .env
 
 .DEFAULT_GOAL := help
-.PHONY: help network check-consul certs kv-seed deploy up build down clean \
+.PHONY: help network check-consul consul-ui certs kv-seed deploy up build down clean \
         restart ps logs urls \
         test test-operational test-network test-ratelimit test-cb test-retry \
         test-consul-lifecycle test-health
@@ -54,16 +55,20 @@ network: ## Crea la red privada backend (internal) si no existe
 	  echo ">> red $(BACKEND_NETWORK) creada (internal=true)"; \
 	fi
 
-check-consul: ## Verifica que Consul esté corriendo solo en la red backend
+check-consul: ## Verifica Consul en backend y su UI/API sólo en loopback:8501
 	@if ! docker inspect $(CONSUL_CONTAINER) >/dev/null 2>&1; then \
 	  echo "ERROR: contenedor Consul '$(CONSUL_CONTAINER)' no está corriendo" >&2; exit 1; \
 	fi
 	@nets="$$(docker inspect -f '{{range $$k,$$v := .NetworkSettings.Networks}}{{$$k}} {{end}}' $(CONSUL_CONTAINER))"; \
 	echo "$$nets" | grep -qw "$(BACKEND_NETWORK)" || { echo "ERROR: Consul no está en $(BACKEND_NETWORK): $$nets" >&2; exit 1; }; \
-	echo "$$nets" | grep -qw "mired" && { echo "ERROR: Consul sigue en mired: $$nets" >&2; exit 1; } || true; \
-	ports="$$(docker inspect -f '{{json .HostConfig.PortBindings}}' $(CONSUL_CONTAINER))"; \
-	case "$$ports" in ''|'{}'|'null') ;; *) echo "ERROR: Consul publica puertos: $$ports" >&2; exit 1;; esac
-	@echo ">> Consul OK en $(BACKEND_NETWORK), sin puertos publicados"
+	echo "$$nets" | grep -qw "mired" && { echo "ERROR: Consul sigue en mired: $$nets" >&2; exit 1; } || true
+	@docker inspect -f '{{json .HostConfig.PortBindings}}' $(CONSUL_CONTAINER) | python3 -c 'import json,sys; d=json.load(sys.stdin) or {}; allowed=lambda p,ip,hp: p=="8501/tcp" and hp=="8501" and ip in ("127.0.0.1","::1"); bad=["%s->%s:%s" % (p, b.get("HostIp",""), b.get("HostPort","")) for p, bs in d.items() for b in (bs or []) if not allowed(p, b.get("HostIp",""), b.get("HostPort",""))]; sys.stderr.write("ERROR: Consul publica puertos no permitidos: " + ", ".join(bad) + " (sólo 127.0.0.1:8501)\n") if bad else None; sys.exit(1 if bad else 0)'
+	@echo ">> Consul OK en $(BACKEND_NETWORK); UI/API sólo en https://127.0.0.1:8501"
+
+consul-ui: ## Muestra la URL y el CA para entrar a la UI de Consul
+	@echo "UI Consul: $(CONSUL_LOCAL_URL)/ui"
+	@echo "  CA a confiar en el navegador: $(CONSUL_CA_FILE)"
+	@echo "  Login con el management token (CONSUL_INITIAL_MANAGEMENT_TOKEN)."
 
 kv-seed: check-consul ## Carga deploy/kv/* en Consul KV (CONSUL_ENABLED es env, no KV)
 	@if [ -z "$(CONSUL_ORCHESTRATOR_TOKEN)" ]; then \
@@ -104,7 +109,7 @@ up: network check-consul ## Arranque ORDENADO por fases + KV seed + espera healt
 deploy: build up ## Despliegue completo: build + arranque ordenado + espera healthy
 
 build: ## Compila/actualiza las imágenes
-	@cd .. && $(COMPOSE) -f deploy/compose.yaml build
+	@cd .. && $(COMPOSE) -f deploy-microservices-pdf-extractext/compose.yaml build
 
 down: ## Baja el stack (conserva volúmenes/datos)
 	$(COMPOSE) down

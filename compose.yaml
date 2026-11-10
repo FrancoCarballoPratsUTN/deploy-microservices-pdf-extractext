@@ -10,8 +10,9 @@ name: pdf-extractext
 #   - backend (external, internal: true, pdf-extractext_backend): red privada.
 #     Traefik público, Traefik interno, orquestador, extract, persistence,
 #     auditlog, mongo y Consul comparten esta red. Sin TLS interno.
-#   - Consul corre en backend (container_name: consul), sin puertos publicados.
-#     El host accede por `docker exec`. Descubre servicios por Consul Catalog.
+#   - Consul corre en backend (container_name: consul); su UI/API se publica
+#     sólo en loopback (127.0.0.1:8501). El resto del acceso del host usa
+#     `docker exec`. Descubre servicios por Consul Catalog.
 #
 # CONSUL_ENABLED es una variable de entorno del proceso: se fija a "true" en
 # todos los servicios. La configuración funcional se carga desde Consul KV al

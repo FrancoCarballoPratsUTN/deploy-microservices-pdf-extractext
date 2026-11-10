@@ -5,7 +5,8 @@
 # Verifica la topología de dos Traefik y dos redes:
 #   - red `backend` external e internal:true; red `edge` del proyecto
 #   - sólo traefik-public publica 80/443; traefik-internal no publica nada
-#   - Consul corre en `backend` sin puertos publicados ni red `mired`
+#   - Consul corre en `backend`, sin red `mired` y con UI/API sólo en
+#     loopback (127.0.0.1:8501)
 #   - ningún contenedor del stack usa `mired`
 #   - microservicios/mongo solo en `backend`; traefik-public en `edge` + `backend`
 #   - no-new-privileges, cap_drop ALL, read_only y sin docker.sock expuesto
@@ -45,10 +46,18 @@ if docker inspect "$CONSUL_CONTAINER" >/dev/null 2>&1; then
   assert_contains "consul en backend" "$NETWORK" "$consul_nets"
   assert_not_contains "consul NO en mired" "mired" "$consul_nets"
   consul_ports="$(docker inspect -f '{{json .HostConfig.PortBindings}}' "$CONSUL_CONTAINER")"
-  case "$consul_ports" in
-    ''|'{}'|'null') ok "consul no publica puertos al host" ;;
-    *) ko "consul publica puertos al host: $consul_ports" ;;
-  esac
+  # Sólo se permite la UI/API en loopback: 127.0.0.1:8501 (o [::1]:8501).
+  if python3 -c 'import json,sys
+d = json.loads(sys.argv[1]) or {}
+allowed = lambda p, ip, hp: p == "8501/tcp" and hp == "8501" and ip in ("127.0.0.1", "::1")
+bad = ["%s->%s:%s" % (p, b.get("HostIp", ""), b.get("HostPort", ""))
+       for p, bs in d.items() for b in (bs or [])
+       if not allowed(p, b.get("HostIp", ""), b.get("HostPort", ""))]
+sys.exit(1 if bad else 0)' "$consul_ports"; then
+    ok "consul sólo publica UI/API en loopback:8501"
+  else
+    ko "consul publica puertos no permitidos al host: $consul_ports"
+  fi
 else
   ko "contenedor Consul '$CONSUL_CONTAINER' no encontrado"
 fi

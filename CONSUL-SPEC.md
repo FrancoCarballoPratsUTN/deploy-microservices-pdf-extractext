@@ -28,9 +28,10 @@ topology.
     `traefik-public`, `traefik-internal`, `orchestrator`, `extract`,
     `persistence`, `auditlog`, `mongo`, and Consul share it. No TLS inside.
 - Consul runs from `/home/francocp12/Documents/Services/consul` on `backend`
-  only (`container_name: consul`). It does not publish ports and does not join
-  `mired`. Host access (UI/API/tests/scripts/bootstrap) uses `docker exec`.
-  Consul remains outside the request path.
+  only (`container_name: consul`). It does not join `mired`. Its UI/API is
+  published **only on loopback** (`127.0.0.1:8501`); it is never bound to
+  `0.0.0.0` or exposed through Traefik. Host access for tests/scripts/bootstrap
+  uses `docker exec`. Consul remains outside the request path.
 
 ## Service discovery contract
 
@@ -131,6 +132,8 @@ not silently fall back to an incomplete local configuration.
 - Certificates, private keys, and tokens must not appear in compose files,
   `.env.example`, Consul tags, or versioned documentation.
 - Consul's management API must not be published through the application edge.
+  Host exposure is restricted to loopback (`127.0.0.1:8501`) and must never bind
+  to a routable interface (`0.0.0.0`, `::`, LAN IP).
 
 ## Bootstrap and operations
 

@@ -2,13 +2,13 @@
 
 Despliegue **unificado** del sistema *pdf-extractext*: un único `compose.yaml`
 levanta `traefik-public` + `traefik-internal` + orquestador + extract (×5) +
-persistence + auditlog + Mongo. Consul corre aparte, **solo en la red privada**,
-sin puertos publicados.
+persistence + auditlog + Mongo. Consul corre aparte, **solo en la red privada**;
+su UI/API se publica únicamente en loopback (`127.0.0.1:8501`).
 
-- **Borde público**: `traefik-public` (80/443, TLS). Único contenedor que publica puertos.
+- **Borde público**: `traefik-public` (80/443, TLS). Único servicio del stack que publica puertos en la red; Consul sólo expone su UI/API en loopback.
 - **Gateway E-W**: `traefik-internal` (`:8443`, HTTP plano, sin puertos). Los retries E-W viven aquí; la cara pública nunca se reintenta.
 - **Redes**: `edge` (proyecto) y `backend` (externa, `internal: true`, `pdf-extractext_backend`). `backend` la comparten Traefik público/interno, orquestador, MS, mongo y Consul. Sin TLS interno.
-- **Consul**: `container_name: consul`, solo en `backend`, sin `mired`. Host/tests/scripts acceden por `docker exec`.
+- **Consul**: `container_name: consul`, solo en `backend`, sin `mired`. Host/tests/scripts acceden por `docker exec`; la UI/API se expone sólo en `127.0.0.1:8501` (`https://localhost:8501/ui`).
 - **`CONSUL_ENABLED`**: variable de **entorno del proceso**, fijada a `"true"` en `compose.yaml`. No es clave de KV ni se lee de `deploy/.env`. La config funcional vive en Consul KV (`deploy/kv/*`, `make kv-seed`).
 
 > Nota: este README conserva contexto histórico de fases anteriores; las secciones operativas críticas (bootstrap, redes, Traefik, Consul, tests) reflejan la topología actual. Si algo contradice el compose/Makefile, manda el compose/Makefile.
@@ -435,7 +435,7 @@ cp .env.example .env
 - `deploy/.env` es **bootstrap**: dirección/CA/tokens de Consul y parámetros de infraestructura.
 - `CONSUL_ENABLED` es variable de entorno fijada a `"true"` en `compose.yaml`; no va en `.env` ni en KV.
 - Las URLs E-W/health del orquestador se siembran en KV desde `deploy/kv/orchestrator.env` con `make kv-seed` (usa `docker exec` + `CONSUL_ORCHESTRATOR_TOKEN`).
-- Consul debe estar corriendo en `backend` con `container_name: consul`, sin puertos publicados. Levántalo desde `/home/francocp12/Documents/Services/consul`.
+- Consul debe estar corriendo en `backend` con `container_name: consul`. Su UI/API se publica **sólo en loopback** (`127.0.0.1:8501`), nunca en `0.0.0.0` ni por Traefik. Levántalo desde `/home/francocp12/Documents/Services/consul`; `make check-consul` valida esa regla y `make consul-ui` muestra la URL y el CA.
 - El `.gitignore` excluye `.env`: **nunca** se commitean tokens.
 
 ### 6.3 Levantar el stack (arranque ordenado)

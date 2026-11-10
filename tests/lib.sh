@@ -37,8 +37,9 @@ CORPUS="${CORPUS:-../extract-markdown-microservice-pdf-extractext/tests/stress/p
 CORPUS_PDF="$(cd "$(dirname "$CORPUS")" 2>/dev/null && pwd)/$(basename "$CORPUS")"
 
 # --- Consul (API interna vía docker exec) ---------------------------------
-# Consul corre solo en la red privada, sin puertos publicados. Los tests/scripts
-# acceden a su API desde el contenedor `consul`.
+# Consul corre solo en la red privada; su UI/API se publica únicamente en
+# loopback (127.0.0.1:8501). Los tests/scripts acceden a su API desde el
+# contenedor `consul` vía `docker exec`.
 CONSUL_CONTAINER="${CONSUL_CONTAINER:-consul}"
 CONSUL_LOCAL_URL="${CONSUL_LOCAL_URL:-https://127.0.0.1:8501}"
 CONSUL_LOCAL_CA="${CONSUL_LOCAL_CA:-/consul/config/tls/consul-ca.pem}"
