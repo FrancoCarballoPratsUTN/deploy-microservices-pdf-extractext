@@ -1,0 +1,48 @@
+# Plantilla de configuración estática de Traefik público (deploy).
+#
+# La copia final se genera al arrancar desde `entrypoint.sh` en /tmp, con la
+# dirección de Consul, el token de catálogo y el nivel de log inyectados desde
+# el entorno. Este archivo no contiene secretos.
+#
+# Entrypoints:
+#   web          :80     HTTP -> redirect 301 a websecure
+#   websecure    :443    TLS público (routers N-S descubiertos por Consul)
+#
+# Descubre solo servicios etiquetados `gateway-public`.
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    address: ":443"
+    http:
+      tls: {}
+
+providers:
+  consulCatalog:
+    exposedByDefault: false
+    refreshInterval: 2s
+    constraints: 'Tag(`gateway-public`)'
+    endpoint:
+      address: "__CONSUL_CATALOG_ADDRESS__"
+      scheme: __CONSUL_CATALOG_SCHEME__
+      token: "__CONSUL_TRAEFIK_TOKEN__"
+      tls:
+        ca: /etc/traefik/consul/ca.pem
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+log:
+  level: "__LOG_LEVEL__"
+
+accessLog:
+  filePath: /dev/stdout
+
+ping: {}

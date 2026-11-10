@@ -1,0 +1,4 @@
+# Secretos y material de CA de desarrollo.
+.env
+certs/*.pem
+certs/*.key

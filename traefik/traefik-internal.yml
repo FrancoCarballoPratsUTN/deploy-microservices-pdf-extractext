@@ -1,0 +1,40 @@
+# Plantilla de configuración estática de Traefik interno (deploy).
+#
+# La copia final se genera al arrancar desde `entrypoint.sh` en /tmp, con la
+# dirección de Consul, el token de catálogo y el nivel de log inyectados desde
+# el entorno. Este archivo no contiene secretos.
+#
+# Entrypoints:
+#   web-internal :8443   HTTP plano interno (E-W): orchestrator/MS -> Traefik
+#                        NO publicado al host. Corre sobre la red `backend`
+#                        (internal: true); TLS termina solo en el borde público.
+#
+# Descubre solo servicios etiquetados `gateway-internal`. Los retries E-W se
+# aplican aquí; nunca se reintenta la cara pública hacia el orquestador.
+
+entryPoints:
+  web-internal:
+    address: ":8443"
+
+providers:
+  consulCatalog:
+    exposedByDefault: false
+    refreshInterval: 2s
+    constraints: 'Tag(`gateway-internal`)'
+    endpoint:
+      address: "__CONSUL_CATALOG_ADDRESS__"
+      scheme: __CONSUL_CATALOG_SCHEME__
+      token: "__CONSUL_TRAEFIK_TOKEN__"
+      tls:
+        ca: /etc/traefik/consul/ca.pem
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+log:
+  level: "__LOG_LEVEL__"
+
+accessLog:
+  filePath: /dev/stdout
+
+ping: {}

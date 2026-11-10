@@ -1,0 +1,72 @@
+# Middlewares y serversTransport (file provider), compartidos por ambos Traefik.
+# Los routers y services se declaran en el provider consulCatalog (tags Consul),
+# de modo que router y service compartan provider. Acá se centraliza la lógica
+# reutilizable. El bloque TLS vive en tls.yml y lo monta solo traefik-public.
+
+http:
+  # Transporte hacia los backends (Traefik -> MS). HTTP/1.1 forzado: h2c
+  # (preface) rompería contra Go net/http y uvicorn con 505. El timeout de
+  # cabecera alinea con HTTP_TIMEOUT del orquestador (35s).
+  serversTransports:
+    default:
+      disableHTTP2: true
+      forwardingTimeouts:
+        responseHeaderTimeout: 35s
+
+  middlewares:
+    # Cabeceras de seguridad estándar (N-S y E-W).
+    security-headers:
+      headers:
+        customFrameOptionsValue: SAMEORIGIN
+        contentTypeNosniff: true
+        browserXssFilter: true
+        referrerPolicy: no-referrer
+        permissionsPolicy: camera=(), microphone=(), geolocation=()
+
+    # Límite de peticiones por cliente en la cara pública (N-S).
+    api-ratelimit:
+      rateLimit:
+        average: 50
+        burst: 100
+
+    # Dos intentos totales (uno inicial y un retry) para fallos transitorios.
+    # El breaker queda antes (más externo): cuando abre, evita llegar al retry.
+    # Extract recibe PDFs de hasta 15 MiB; 16 MiB deja margen para reproducirlos.
+    extract-retry:
+      retry:
+        attempts: 2
+        initialInterval: 200ms
+        maxRequestBodyBytes: 16777216
+        status:
+          - "502-504"
+        disableRetryOnNetworkError: true
+        retryNonIdempotentMethod: true
+
+    # Por defecto Traefik no reintenta POST/PATCH/LOCK; GET, PUT y DELETE sí.
+    # Así POST /texts conserva su 409 ante checksum existente.
+    persistence-retry:
+      retry:
+        attempts: 2
+        initialInterval: 100ms
+        maxRequestBodyBytes: 16777216
+        status:
+          - "502-504"
+        disableRetryOnNetworkError: true
+
+    # Circuit breakers por servicio: 30% de errores de red o 5xx.
+    orchestrator-cb:
+      circuitBreaker:
+        expression: NetworkErrorRatio() > 0.30 || ResponseCodeRatio(500, 600, 0, 600) > 0.30
+    extract-cb:
+      circuitBreaker:
+        expression: NetworkErrorRatio() > 0.30 || ResponseCodeRatio(500, 600, 0, 600) > 0.30
+    persistence-cb:
+      circuitBreaker:
+        expression: NetworkErrorRatio() > 0.30 || ResponseCodeRatio(500, 600, 0, 600) > 0.30
+    audit-cb:
+      circuitBreaker:
+        expression: NetworkErrorRatio() > 0.30 || ResponseCodeRatio(500, 600, 0, 600) > 0.30
+
+  # Los ROUTERS viven en el provider consulCatalog (tags Consul), no acá: así
+  # cada router y su service se crean en el MISMO provider. Este archivo define
+  # los middlewares que esos routers consumen vía <nombre>@file.

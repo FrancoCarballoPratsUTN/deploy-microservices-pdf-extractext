@@ -1,0 +1,7 @@
+# Certificados TLS del borde público (file provider, montado solo por traefik-public).
+# El tramo E-W es HTTP plano sobre la red backend (internal: true).
+
+tls:
+  certificates:
+    - certFile: /etc/traefik/certs/traefik.pem
+      keyFile: /etc/traefik/certs/traefik-key.pem

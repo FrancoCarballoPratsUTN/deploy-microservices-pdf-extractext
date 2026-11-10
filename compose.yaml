@@ -1,0 +1,303 @@
+name: pdf-extractext
+
+# Despliegue unificado del sistema de microservicios.
+#
+# Topología (dos Traefik, dos redes de datos, sin TLS en la red privada):
+#   - traefik-public (edge + backend): único punto público, puertos 80/443, TLS.
+#   - traefik-internal (backend): gateway E-W en http://:8443, sin puertos
+#     publicados. Los retries E-W viven aquí; nunca se reintenta la cara pública.
+#   - edge: red pública del proyecto (Traefik público).
+#   - backend (external, internal: true, pdf-extractext_backend): red privada.
+#     Traefik público, Traefik interno, orquestador, extract, persistence,
+#     auditlog, mongo y Consul comparten esta red. Sin TLS interno.
+#   - Consul corre en backend (container_name: consul), sin puertos publicados.
+#     El host accede por `docker exec`. Descubre servicios por Consul Catalog.
+#
+# CONSUL_ENABLED es una variable de entorno del proceso: se fija a "true" en
+# todos los servicios. La configuración funcional se carga desde Consul KV al
+# arrancar; deploy/.env contiene solo bootstrap (dirección, CA, tokens).
+#
+# Orden de arranque: NO se usa depends_on. `make deploy` levanta por fases y
+# espera (--wait) el health de cada una:
+#   1. mongo
+#   2. traefik-public, traefik-internal
+#   3. extract, persistence, auditlog
+#   4. orchestrator
+
+networks:
+  edge:
+    driver: bridge
+  backend:
+    external: true
+    name: pdf-extractext_backend
+
+volumes:
+  mongo-data:
+
+services:
+  traefik-public:
+    image: traefik:v3.7.14
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/etc/traefik/entrypoint.sh"]
+    environment:
+      CONSUL_CATALOG_ADDRESS: ${CONSUL_CATALOG_ADDRESS:-consul:8501}
+      CONSUL_CATALOG_SCHEME: ${CONSUL_CATALOG_SCHEME:-https}
+      CONSUL_TRAEFIK_TOKEN: ${CONSUL_TRAEFIK_TOKEN:?CONSUL_TRAEFIK_TOKEN is required}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./traefik/traefik-public.yml:/etc/traefik/traefik.yml.template:ro
+      - ./traefik/entrypoint.sh:/etc/traefik/entrypoint.sh:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic/dynamic.yml:ro
+      - ./traefik/tls.yml:/etc/traefik/dynamic/tls.yml:ro
+      - ./certs:/etc/traefik/certs:ro
+      - ${CONSUL_CA_FILE:-./certs/rootCA.pem}:/etc/traefik/consul/ca.pem:ro
+    networks:
+      - edge
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  traefik-internal:
+    image: traefik:v3.7.14
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/etc/traefik/entrypoint.sh"]
+    environment:
+      CONSUL_CATALOG_ADDRESS: ${CONSUL_CATALOG_ADDRESS:-consul:8501}
+      CONSUL_CATALOG_SCHEME: ${CONSUL_CATALOG_SCHEME:-https}
+      CONSUL_TRAEFIK_TOKEN: ${CONSUL_TRAEFIK_TOKEN:?CONSUL_TRAEFIK_TOKEN is required}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - ./traefik/traefik-internal.yml:/etc/traefik/traefik.yml.template:ro
+      - ./traefik/entrypoint.sh:/etc/traefik/entrypoint.sh:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic/dynamic.yml:ro
+      - ${CONSUL_CA_FILE:-./certs/rootCA.pem}:/etc/traefik/consul/ca.pem:ro
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  orchestrator:
+    build:
+      context: ../ValidationMicroservices-pdf-extractext
+      dockerfile: Dockerfile
+    image: pdf-extractext-orchestrator:v1.1.0
+    restart: unless-stopped
+    init: true
+    environment:
+      # CONSUL_ENABLED es variable de entorno del proceso: el deploy usa Consul.
+      CONSUL_ENABLED: "true"
+      CONSUL_HTTP_ADDR: ${CONSUL_HTTP_ADDR:-https://consul:8501}
+      CONSUL_HTTP_TOKEN: ${CONSUL_ORCHESTRATOR_TOKEN:?CONSUL_ORCHESTRATOR_TOKEN is required}
+      CONSUL_HTTP_CA_FILE: /consul/ca.pem
+      CONSUL_KV_PREFIX: ${CONSUL_ORCHESTRATOR_KV_PREFIX:-pdf-extractext/dev/orchestrator}
+      CONSUL_SERVICE_NAME: orchestrator
+      # gateway-public: descubierto solo por traefik-public.
+      CONSUL_SERVICE_TAGS: "${ORCHESTRATOR_CONSUL_TAGS:-gateway-public;traefik.enable=true;traefik.http.routers.orchestrator-public.rule=Host(`pdf-extractext.localhost`) && PathPrefix(`/api`);traefik.http.routers.orchestrator-public.entrypoints=websecure;traefik.http.routers.orchestrator-public.tls=true;traefik.http.routers.orchestrator-public.middlewares=security-headers@file,api-ratelimit@file,orchestrator-cb@file}"
+
+      # Tráfico E-W vía traefik-internal (HTTP plano). KV tiene prioridad.
+      EXTRACT_BASE_URL: ${EXTRACT_BASE_URL:-http://traefik-internal:8443}
+      PERSISTENCE_BASE_URL: ${PERSISTENCE_BASE_URL:-http://traefik-internal:8443}
+      AUDIT_LOG_BASE_URL: ${AUDIT_LOG_BASE_URL:-http://traefik-internal:8443}
+      # Health aggregation por DNS directo (readiness). KV tiene prioridad.
+      EXTRACT_HEALTH_URL: ${EXTRACT_HEALTH_URL:-http://extract:8080/healthz}
+      PERSISTENCE_HEALTH_URL: ${PERSISTENCE_HEALTH_URL:-http://persistence:8000/readyz}
+      AUDIT_LOG_HEALTH_URL: ${AUDIT_LOG_HEALTH_URL:-http://auditlog:8000/readyz}
+      HEALTH_CHECK_TIMEOUT: ${HEALTH_CHECK_TIMEOUT:-2s}
+
+      # Bootstrap/fallback: en deploy la configuración funcional vive en KV.
+      AUDIT_LOG_API_TOKEN: ${AUDIT_LOG_API_TOKEN:-local-audit-token}
+      PERSISTENCE_API_TOKEN: ${PERSISTENCE_API_TOKEN:-local-persistence-token}
+      PORT: ${PORT:-8080}
+      HTTP_TIMEOUT: ${HTTP_TIMEOUT:-35s}
+      SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-35s}
+      MAX_PDF_SIZE_BYTES: ${MAX_PDF_SIZE_BYTES:-15MB}
+      MAX_TEXT_BODY_BYTES: ${MAX_TEXT_BODY_BYTES:-15MB}
+      MAX_PDF_PAGES: ${MAX_PDF_PAGES:-1000}
+      LOG_MAX_VALUE_LENGTH: ${LOG_MAX_VALUE_LENGTH:-256}
+      LOG_MAX_STACK_LENGTH: ${LOG_MAX_STACK_LENGTH:-4096}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    volumes:
+      - ${CONSUL_CA_FILE:-./certs/rootCA.pem}:/consul/ca.pem:ro
+    stop_grace_period: ${STOP_GRACE_PERIOD:-45s}
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    # El orquestador se construye con distroless (sin wget/shell), por lo que
+    # no hay healthcheck in-container. La disponibilidad se valida desde fuera
+    # con /healthz (liveness) y /readyz (readiness agregada de extract,
+    # persistence y auditlog).
+  extract:
+    build:
+      context: ../extract-markdown-microservice-pdf-extractext
+      dockerfile: Dockerfile
+    image: pdf-extractext-extract:v1.0.0
+    restart: unless-stopped
+    deploy:
+      replicas: 5
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    stop_grace_period: ${STOP_GRACE_PERIOD:-45s}
+    environment:
+      # CONSUL_ENABLED es variable de entorno del proceso: el deploy usa Consul.
+      CONSUL_ENABLED: "true"
+      CONSUL_HTTP_ADDR: ${CONSUL_HTTP_ADDR:-https://consul:8501}
+      CONSUL_HTTP_TOKEN: ${CONSUL_EXTRACT_TOKEN:?CONSUL_EXTRACT_TOKEN is required}
+      CONSUL_HTTP_CA_FILE: /consul/ca.pem
+      CONSUL_KV_PREFIX: ${CONSUL_EXTRACT_KV_PREFIX:-pdf-extractext/dev/extract}
+      CONSUL_SERVICE_NAME: extract
+      # gateway-internal: descubierto solo por traefik-internal.
+      CONSUL_SERVICE_TAGS: "${EXTRACT_CONSUL_TAGS:-gateway-internal;traefik.enable=true;traefik.http.routers.extract-ew.rule=PathPrefix(`/extract`);traefik.http.routers.extract-ew.entrypoints=web-internal;traefik.http.routers.extract-ew.middlewares=security-headers@file,extract-cb@file,extract-retry@file}"
+      # Fallback por entorno; KV tiene prioridad.
+      PDF_OXIDE_LIB_PATH: ${PDF_OXIDE_LIB_PATH:-/opt/pdf_oxide/libpdf_oxide.so}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-50}
+      MAX_PAGES: ${MAX_PAGES:-1000}
+      MAX_WORKERS: ${MAX_WORKERS:-2}
+      QUEUE_SIZE: ${QUEUE_SIZE:-56}
+      QUEUE_MAX_MB: ${QUEUE_MAX_MB:-256}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+    networks:
+      - backend
+    volumes:
+      - ${CONSUL_CA_FILE:-./certs/rootCA.pem}:/consul/ca.pem:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  persistence:
+    build:
+      context: ../PersistenceMicroservices-pdf-extractext
+    image: pdf-extractext-persistence:v1.0.0
+    restart: unless-stopped
+    environment:
+      # CONSUL_ENABLED es variable de entorno del proceso: el deploy usa Consul.
+      CONSUL_ENABLED: "true"
+      CONSUL_HTTP_ADDR: ${CONSUL_HTTP_ADDR:-https://consul:8501}
+      CONSUL_HTTP_TOKEN: ${CONSUL_PERSISTENCE_TOKEN:?CONSUL_PERSISTENCE_TOKEN is required}
+      CONSUL_HTTP_CA_FILE: /consul/ca.pem
+      CONSUL_KV_PREFIX: ${CONSUL_PERSISTENCE_KV_PREFIX:-pdf-extractext/dev/persistence}
+      CONSUL_SERVICE_NAME: persistence
+      # gateway-internal: descubierto solo por traefik-internal.
+      CONSUL_SERVICE_TAGS: "${PERSISTENCE_CONSUL_TAGS:-gateway-internal;traefik.enable=true;traefik.http.routers.texts-ew.rule=PathPrefix(`/texts`);traefik.http.routers.texts-ew.entrypoints=web-internal;traefik.http.routers.texts-ew.middlewares=security-headers@file,persistence-cb@file,persistence-retry@file}"
+      # Fallback por entorno; KV tiene prioridad.
+      PERSISTENCE_API_TOKEN: ${PERSISTENCE_API_TOKEN:-local-persistence-token}
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
+      MONGO_DATABASE: ${MONGO_DATABASE:-pdf_extractext}
+      MONGO_TEXTS_COLLECTION: ${MONGO_TEXTS_COLLECTION:-texts}
+      MONGO_TIMEOUT_MS: ${MONGO_TIMEOUT_MS:-5000}
+      MAX_TEXT_BODY_BYTES: ${MAX_TEXT_BODY_BYTES:-10485760}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    networks:
+      - backend
+    volumes:
+      - ${CONSUL_CA_FILE:-./certs/rootCA.pem}:/consul/ca.pem:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  auditlog:
+    build:
+      context: ../audit-log-microservice-pdf-extractext
+    image: pdf-extractext-auditlog:v1.1.0
+    restart: unless-stopped
+    environment:
+      # CONSUL_ENABLED es variable de entorno del proceso: el deploy usa Consul.
+      CONSUL_ENABLED: "true"
+      CONSUL_HTTP_ADDR: ${CONSUL_HTTP_ADDR:-https://consul:8501}
+      CONSUL_HTTP_TOKEN: ${CONSUL_AUDIT_TOKEN:?CONSUL_AUDIT_TOKEN is required}
+      CONSUL_HTTP_CA_FILE: /consul/ca.pem
+      CONSUL_KV_PREFIX: ${CONSUL_AUDIT_KV_PREFIX:-pdf-extractext/dev/auditlog}
+      CONSUL_SERVICE_NAME: auditlog
+      # AUDA is a singleton: stable ID replaces its previous Consul registration.
+      CONSUL_SERVICE_ID: auditlog
+      # gateway-internal: descubierto solo por traefik-internal.
+      CONSUL_SERVICE_TAGS: "${AUDIT_CONSUL_TAGS:-gateway-internal;traefik.enable=true;traefik.http.routers.audit-ew.rule=PathPrefix(`/audit`);traefik.http.routers.audit-ew.entrypoints=web-internal;traefik.http.routers.audit-ew.middlewares=security-headers@file,audit-cb@file}"
+      # Fallback por entorno; KV tiene prioridad.
+      SERVICE_API_TOKEN: ${SERVICE_API_TOKEN:-local-audit-token}
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
+      MONGO_DATABASE: ${MONGO_DATABASE_AUDIT:-pdf_extractext_audit}
+      MONGO_AUDIT_LOGS_COLLECTION: ${MONGO_AUDIT_LOGS_COLLECTION:-audit_logs}
+      MONGO_TIMEOUT_MS: ${MONGO_TIMEOUT_MS:-5000}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    networks:
+      - backend
+    volumes:
+      - ${CONSUL_CA_FILE:-./certs/rootCA.pem}:/consul/ca.pem:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    restart: unless-stopped
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - backend
+      - edge
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - FOWNER
+      - DAC_OVERRIDE
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
