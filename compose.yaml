@@ -2,7 +2,8 @@ name: pdf-extractext
 
 # Despliegue unificado del sistema de microservicios.
 #
-# Topología (dos Traefik, dos redes de datos, sin TLS en la red privada):
+# Topología (dos Traefik, dos redes de datos + puente de publicación
+# mongo-local, sin TLS en la red privada):
 #   - traefik-public (edge + backend): único punto público, puertos 80/443, TLS.
 #   - traefik-internal (backend): gateway E-W en http://:8443, sin puertos
 #     publicados. Los retries E-W viven aquí; nunca se reintenta la cara pública.
@@ -13,6 +14,10 @@ name: pdf-extractext
 #   - Consul corre en backend (container_name: consul); su UI/API se publica
 #     sólo en loopback (127.0.0.1:8501). El resto del acceso del host usa
 #     `docker exec`. Descubre servicios por Consul Catalog.
+#   - Mongo corre en backend y publica 27017 sólo en loopback
+#     (127.0.0.1:27017) para Compass. La publicación viaja por el puente no
+#     interno mongo-local (Docker no publica puertos desde redes internal).
+#     Junto con Consul, única publicación al host fuera de traefik-public.
 #
 # CONSUL_ENABLED es una variable de entorno del proceso: se fija a "true" en
 # todos los servicios. La configuración funcional se carga desde Consul KV al
@@ -31,6 +36,11 @@ networks:
   backend:
     external: true
     name: pdf-extractext_backend
+  # Puente no interno usado SOLO por mongo para publicar 27017 en loopback
+  # (127.0.0.1:27017). Docker no publica puertos de contenedores que sólo
+  # están en redes internal; mismo patrón que Consul (consul_local).
+  mongo-local:
+    driver: bridge
 
 volumes:
   mongo-data:
@@ -279,14 +289,19 @@ services:
 
   mongo:
     image: mongo:7
+    # 27017 publicado sólo en loopback: acceso del host con Compass
+    # (mongodb://127.0.0.1:27017) sin exponer el puerto a otras interfaces.
+    # `mongo-local` existe sólo para habilitar esa publicación (Docker no
+    # publica puertos desde redes internal). Mismo patrón que la UI/API de
+    # Consul (consul_local + 127.0.0.1:8501).
     ports:
-      - "27017:27017"
+      - "127.0.0.1:27017:27017"
     restart: unless-stopped
     volumes:
       - mongo-data:/data/db
     networks:
       - backend
-      - edge
+      - mongo-local
     security_opt:
       - no-new-privileges:true
     cap_drop:

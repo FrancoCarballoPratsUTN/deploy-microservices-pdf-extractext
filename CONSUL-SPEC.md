@@ -99,9 +99,22 @@ functional application configuration is stored under each service KV prefix.
 fixes it to `"true"` in `compose.yaml` for every service. Per-microservice
 `.env` files may keep `CONSUL_ENABLED=false` for standalone testing.
 
-`make kv-seed` writes `deploy/kv/orchestrator.env` via `docker exec` using
-`CONSUL_ORCHESTRATOR_TOKEN`. It seeds the orchestrator E-W/health URLs and
-`RETRY_MAX_ATTEMPTS=1` (Traefik owns E-W retries):
+`make kv-seed` writes one `deploy/kv/<service>.env` file per service prefix
+(orchestrator, extract, persistence, auditlog) via `docker exec`, using a
+dedicated `CONSUL_KV_SEED_TOKEN` with `key:write` only under the root prefix
+(`pdf-extractext/dev/`). It is idempotent and non-destructive: it puts each key
+individually and never deletes keys.
+
+Seeding is required because every service treats a missing prefix (HTTP 404) as
+a fatal startup error; persistence also rejects an empty prefix. Without the
+seed, a clean Consul cannot start extract, persistence or auditlog even though
+`compose.yaml` defines environment fallbacks.
+
+API tokens (`PERSISTENCE_API_TOKEN`, `AUDIT_LOG_API_TOKEN`, `SERVICE_API_TOKEN`)
+are **not** seeded: they are secrets and stay in the compose environment
+(fallback) or in the already-populated KV. The seed covers the non-secret
+functional configuration (URLs, health probes, limits, timeouts, Mongo
+connectivity):
 
 ```bash
 cd deploy && make kv-seed
@@ -119,6 +132,11 @@ not silently fall back to an incomplete local configuration.
 - Traefik receives a read-only catalog token.
 - Each application receives only the KV read and service registration
   permissions it needs.
+- `make kv-seed` uses a dedicated seed token with `key:write` scoped to the
+  deployment root prefix, never the management token. Its policy is
+  `key_prefix "pdf-extractext/dev/" { policy = "write" }`; the token is
+  provisioned outside Git and stored only in `deploy/.env` as
+  `CONSUL_KV_SEED_TOKEN`.
 - The Consul agent has a dedicated internal token with `node:write` only for its
   own node and service read permission required by anti-entropy. It is installed
   through the agent-token API and persisted with `acl.enable_token_persistence`;
@@ -144,7 +162,7 @@ material. From `deploy/`:
 make network       # crea pdf-extractext_backend (internal) si no existe
 # recrear/levantar Consul desde /home/francocp12/Documents/Services/consul
 make certs
-make kv-seed       # escribe deploy/kv/* en Consul KV vía docker exec
+make kv-seed       # escribe deploy/kv/*.env en Consul KV vía docker exec
 make deploy
 make test
 ```

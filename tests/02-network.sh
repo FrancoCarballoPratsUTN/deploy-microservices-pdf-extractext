@@ -2,9 +2,11 @@
 #
 # Test de hardening y aislamiento de red del deploy.
 #
-# Verifica la topología de dos Traefik y dos redes:
+# Verifica la topología de dos Traefik, dos redes + puente mongo-local:
 #   - red `backend` external e internal:true; red `edge` del proyecto
 #   - sólo traefik-public publica 80/443; traefik-internal no publica nada
+#   - mongo publica 27017 sólo en loopback (127.0.0.1:27017), para Compass,
+#     vía el puente no interno mongo-local (mismo patrón que Consul)
 #   - Consul corre en `backend`, sin red `mired` y con UI/API sólo en
 #     loopback (127.0.0.1:8501)
 #   - ningún contenedor del stack usa `mired`
@@ -29,6 +31,20 @@ for svc in orchestrator extract persistence auditlog mongo traefik-internal; do
   assert_not_contains "'$svc' NO en edge" "pdf-extractext_edge" "$nets"
   assert_not_contains "'$svc' NO en mired" "mired" "$nets"
 done
+
+# Excepción explícita (D12.5): mongo, además de `backend`, está en
+# `mongo-local`, puente NO interno que existe sólo para publicar 27017 en
+# loopback (127.0.0.1:27017, para Compass). Docker no publica puertos desde
+# redes internal, de ahí ese puente. Mismo patrón que Consul (consul_local).
+mongo_cid="$(service_containers mongo | head -1)"
+if [[ -n "$mongo_cid" ]]; then
+  mongo_nets="$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$mongo_cid")"
+  assert_contains "mongo en mongo-local (publicación en loopback)" "pdf-extractext_mongo-local" "$mongo_nets"
+  ml_internal="$(docker network inspect pdf-extractext_mongo-local --format '{{.Internal}}' 2>/dev/null || echo missing)"
+  assert_eq "red pdf-extractext_mongo-local no internal" "false" "$ml_internal"
+else
+  ko "no hay contenedor para 'mongo'"
+fi
 
 tp_cid="$(service_containers traefik-public | head -1)"
 if [[ -n "$tp_cid" ]]; then
@@ -62,7 +78,7 @@ else
   ko "contenedor Consul '$CONSUL_CONTAINER' no encontrado"
 fi
 
-section "3) Puertos publicados (sólo traefik-public)"
+section "3) Puertos publicados (traefik-public; mongo sólo en loopback)"
 while IFS='|' read -r name ports; do
   [[ -z "$name" ]] && continue
   case "$name" in
@@ -72,6 +88,29 @@ while IFS='|' read -r name ports; do
       ;;
     *traefik-internal*)
       if [[ "$ports" == *"->"* ]]; then ko "traefik-internal publica puertos: $ports"; else ok "traefik-internal no publica puertos"; fi
+      ;;
+    *mongo*)
+      # Excepción explícita: mongo publica 27017 sólo en loopback
+      # (127.0.0.1:27017, para Compass), igual patrón que la UI de Consul.
+      mongo_ports="$(docker inspect -f '{{json .HostConfig.PortBindings}}' "$name")"
+      if python3 -c 'import json,sys
+d = json.loads(sys.argv[1]) or {}
+allowed = lambda p, ip, hp: p == "27017/tcp" and hp == "27017" and ip in ("127.0.0.1", "::1")
+bs = [(p, b) for p, lst in d.items() for b in (lst or [])]
+bad = ["%s->%s:%s" % (p, b.get("HostIp", ""), b.get("HostPort", ""))
+       for p, b in bs if not allowed(p, b.get("HostIp", ""), b.get("HostPort", ""))]
+good = any(allowed(p, b.get("HostIp", ""), b.get("HostPort", "")) for p, b in bs)
+sys.exit(0 if good and not bad else 1)' "$mongo_ports"; then
+        ok "mongo publica 27017 sólo en loopback:127.0.0.1 (Compass)"
+      else
+        ko "mongo debe publicar 27017 sólo en loopback (127.0.0.1:27017): $mongo_ports"
+      fi
+      # El host debe poder abrir conexión (lo que hace Compass).
+      if timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/27017' 2>/dev/null; then
+        ok "host conecta a mongo en 127.0.0.1:27017 (Compass)"
+      else
+        ko "host NO conecta a mongo en 127.0.0.1:27017 (¿mongo-local internal o mongo caído?)"
+      fi
       ;;
     *)
       if [[ "$ports" != *"->"* ]]; then

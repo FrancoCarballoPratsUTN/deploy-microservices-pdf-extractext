@@ -5,9 +5,9 @@ levanta `traefik-public` + `traefik-internal` + orquestador + extract (×5) +
 persistence + auditlog + Mongo. Consul corre aparte, **solo en la red privada**;
 su UI/API se publica únicamente en loopback (`127.0.0.1:8501`).
 
-- **Borde público**: `traefik-public` (80/443, TLS). Único servicio del stack que publica puertos en la red; Consul sólo expone su UI/API en loopback.
+- **Borde público**: `traefik-public` (80/443, TLS). Único servicio que publica puertos en la red; en loopback quedan Consul (`127.0.0.1:8501`) y mongo (`127.0.0.1:27017`, para Compass).
 - **Gateway E-W**: `traefik-internal` (`:8443`, HTTP plano, sin puertos). Los retries E-W viven aquí; la cara pública nunca se reintenta.
-- **Redes**: `edge` (proyecto) y `backend` (externa, `internal: true`, `pdf-extractext_backend`). `backend` la comparten Traefik público/interno, orquestador, MS, mongo y Consul. Sin TLS interno.
+- **Redes**: `edge` (proyecto) y `backend` (externa, `internal: true`, `pdf-extractext_backend`). `backend` la comparten Traefik público/interno, orquestador, MS, mongo y Consul. Sin TLS interno. `mongo-local`: puente no interno que sólo usa mongo para publicar `27017` en loopback.
 - **Consul**: `container_name: consul`, solo en `backend`, sin `mired`. Host/tests/scripts acceden por `docker exec`; la UI/API se expone sólo en `127.0.0.1:8501` (`https://localhost:8501/ui`).
 - **`CONSUL_ENABLED`**: variable de **entorno del proceso**, fijada a `"true"` en `compose.yaml`. No es clave de KV ni se lee de `deploy/.env`. La config funcional vive en Consul KV (`deploy/kv/*`, `make kv-seed`).
 
@@ -39,15 +39,16 @@ Antes de la Fase 11 el **orquestador** era el punto público único y hablaba
 directo con los microservicios por sus puertos. Esta fase introduce un
 **Traefik propio** que:
 
-- es el **gateway N-S** (norte-sur): el único servicio que publica puertos en el
-  host (`80`/`443`) y termina TLS;
+- es el **gateway N-S** (norte-sur): el único servicio que publica puertos en
+  las interfaces de red del host (`80`/`443`) y termina TLS; mongo y Consul
+  sólo publican en loopback;
 - es el **router E-W** (este-oeste): todo el tráfico entre el orquestador y los
   MS pasa por su entrypoint interno `web-internal` (`:8443`, HTTP plano), no por
   DNS directo;
 - **centraliza la resiliencia E-W en Traefik**: circuit breakers y retries por
   servicio; el rate limit se aplica en el borde N-S.
 - **aísla a los MS** de la web: ninguno publica puertos ni es alcanzable desde
-  el host.
+  el host. Sólo mongo escucha en loopback (`127.0.0.1:27017`) para Compass.
 
 El orquestador **no desaparece**: sigue siendo la lógica de negocio (valida,
 deduplica, orquesta). 
@@ -95,12 +96,18 @@ upstream se obtiene de los logs estructurados correlacionados por `X-Request-ID`
 | --------- | --------------- | ---------------------------------------------------- |
 | `edge`    | `bridge`        | Traefik, orquestador                                 |
 | `backend` | `bridge` **`internal: true`** | Traefik, orquestador, extract×5, persistence, auditlog, mongo |
+| `mongo-local` | `bridge` | mongo (sólo para publicar `27017` en loopback) |
 
 - La red `backend` es **`internal: true`**: Docker no le da gateway a Internet.
   Los MS no pueden salir a la red pública y, sobre todo, el host no puede
   alcanzarlos: la única entrada es Traefik.
 - El **orquestador está en ambas redes**: recibe de `edge` (lo público) y sale
   por `backend`.
+- **`mongo-local` existe por una limitación de Docker**: no publica puertos de
+  contenedores que sólo están en redes `internal`. Es un puente no interno al
+  que sólo se une mongo, para publicar `27017` en loopback
+  (`127.0.0.1:27017`, Compass). Mismo patrón que Consul (`consul_local` +
+  `127.0.0.1:8501`).
 - El **proyecto compose se llama `pdf-extractext`**, así que los nombres reales
   de red son `pdf-extractext_edge` y `pdf-extractext_backend`. Por eso el
   provider de Traefik fija `network: pdf-extractext_backend` (si no, Docker
@@ -196,7 +203,7 @@ del Extract (30s).
 | `extract` | build `../Conversor/extract-markdown-microservice-pdf-extractext` | 8080 | **5** | – |
 | `persistence` | build `../persistence/PersistenceMicroservices-pdf-extractext` | 8000 | 1 | – |
 | `auditlog` | build `../audit_log/audit-log-microservice-pdf-extractext` | 8000 | 1 | – |
-| `mongo` | `mongo:7` | 27017 | 1 | – |
+| `mongo` | `mongo:7` | 27017 | 1 | `127.0.0.1:27017` (loopback, Compass) |
 
 ---
 
@@ -205,7 +212,7 @@ del Extract (30s).
 ```
 deploy/
 ├── Makefile                  # operación + tests (deploy ordenado, test, test-cb, ...)
-├── compose.yaml              # stack unificado (6 servicios, 2 redes, 1 volumen)
+├── compose.yaml              # stack unificado (6 servicios, 2 redes + mongo-local, 1 volumen)
 ├── .env.example              # plantilla de variables (copiar a .env)
 ├── .gitignore                # ignora .env y el material de CA
 ├── README.md                 # este archivo
@@ -238,7 +245,8 @@ deploy/
   batería completa (ver §7.x).
 - **`tests/`** — tests de usuario ejecutables por `make test*`: operatividad E2E,
   aislamiento, rate limit, circuit breaker y retry.
-- **`compose.yaml`** — único punto de orquestación. Define las dos redes y el
+- **`compose.yaml`** — único punto de orquestación. Define las redes (`edge`,
+  `backend` externa y `mongo-local` de publicación) y el
   volumen, y todos los servicios con su hardening. Que todo el sistema se
   levante con un `docker compose up -d` es el objetivo de la fase (el orden fino
   lo da el Makefile, no `depends_on`; ver §4.5).
@@ -288,13 +296,22 @@ deploy/
    Ver §2.4. *Por qué:* evita el `505` de h2c y alinea timeouts con el
    orquestador.
 
-6. **Dos redes: `edge` y `backend` (`internal: true`); solo Traefik publica.**
+6. **Dos redes de datos: `edge` y `backend` (`internal: true`); solo Traefik
+   publica en la red.**
    *Por qué:* aislar el plano de datos; los MS no son alcanzables desde el host.
+   Única publicación extra al host: mongo en loopback (`127.0.0.1:27017`, ver #7
+   y D12.5).
 
-7. **Mongo incluido en la red `backend`, con volumen nombrado `mongo-data`.**
+7. **Mongo incluido en la red `backend`, con volumen nombrado `mongo-data`,
+   publicado sólo en loopback (`127.0.0.1:27017:27017`).**
    *Por qué:* persistence y auditlog necesitan Mongo; incluirlo evita un
    prerequisito externo. El volumen evita perder datos con un reinicio.
    Bases: `pdf_extractext` (persistence) y `pdf_extractext_audit` (audit).
+   El bind a `127.0.0.1` permite inspeccionarlo desde el host con Compass
+   (`mongodb://127.0.0.1:27017`) sin exponer el puerto a otras interfaces.
+   Como Docker no publica puertos desde redes `internal`, la publicación viaja
+   por el puente no interno `mongo-local` (sólo mongo lo usa; mismo patrón que
+   Consul con `consul_local`). `make test-network` lo verifica explícitamente.
 
 8. **Un único secreto por MS, compartido con el orquestador.**
    El MS lo exige como `SERVICE_API_TOKEN`; el orquestador lo emite como
@@ -323,6 +340,7 @@ deploy/
 | D12.2 | ¿Mongo con volumen persistente? | **Sí** (`mongo-data`) | No perder datos al recrear contenedores; solo `down -v` borra. |
 | D12.3 | ¿Access log de Traefik además del del orquestador? | **Sí**, a stdout | Da la **IP real** del cliente (`X-Forwarded-For`); en el access log del orquestador `remote_addr` es la IP del contenedor Traefik. |
 | D12.4 | ¿Cert de dev por host o por SNI? | Un único cert mkcert multi-SAN | Un solo archivo sirve para todos los SNI (`pdf-extractext.localhost`, `*.pdf-extractext.localhost`, `traefik`, `localhost`, `127.0.0.1`, `::1`). |
+| D12.5 | ¿Mongo alcanzable desde el host (Compass)? | **Sí**, sólo loopback (`127.0.0.1:27017:27017`) vía el puente no interno `mongo-local` | Inspección local con Compass (`mongodb://127.0.0.1:27017`) sin exponer el puerto a otras interfaces; lo verifica `make test-network`. |
 
 ### 4.3 Decisión sobre el provider Docker y servicios caídos
 
@@ -369,10 +387,25 @@ lo garantiza el target `deploy`/`up` del `Makefile`, que levanta por fases y
 | ---- | --------- | ------------------------- |
 | 1 | `mongo` | `healthy` (backing store listo) |
 | 2 | `traefik-public` / `traefik-internal` | `healthy` (borde listo para enrutar) |
-| 3 | `extract`, `persistence`, `auditlog` | los tres `healthy` |
-| 4 | `orchestrator` | `healthy` (entrada, usa a los anteriores) |
+| 3 | `kv-seed` (4 prefijos) + `extract`, `persistence`, `auditlog` | `healthy` de `persistence`/`auditlog` (`extract` no define `HEALTHCHECK`) |
+| 4 | — (sólo espera) | **Consul reporta `passing` cada instancia de los tres** |
+| 5 | `orchestrator` | `healthy` (entrada, usa a los anteriores) |
+| 6 | — (reconciliación) | purga de registros obsoletos de este nodo |
 
-Cada fase usa `docker compose up -d --wait --wait-timeout <WAIT_TIMEOUT> <svcs>`.
+Las fases 1, 2, 3 y 5 usan
+`docker compose up -d --wait --wait-timeout <WAIT_TIMEOUT> <svcs>`.
+La fase 3 siembra el KV **antes** de levantar los servicios de negocio: los
+cuatro leen su prefijo al arrancar y un prefijo ausente es error fatal, así que
+en un Consul limpio el seed tiene que existir antes del primer `up`.
+La fase 4 es la que garantiza que el orquestador no arranque antes de que sus
+dependencias estén realmente enrutables: `scripts/wait-consul-passing.sh`
+consulta `/v1/health/service/<svc>?passing=true` y exige que **cada contenedor
+en ejecución** de `extract`, `persistence` y `auditlog` tenga su `ServiceID` en
+`passing`. Es la misma señal que usa el provider `consulCatalog` de Traefik, así
+que cubre el caso de `extract` (sin `HEALTHCHECK`) y el de cualquier instancia
+que todavía no terminó de registrarse. Si vence `WAIT_TIMEOUT`, `make up` falla
+con el estado de cada check en vez de arrancar el orquestador con ruteo roto.
+
 Al terminar, `make up` reconcilia Consul contra los IDs de los contenedores
 actuales y elimina registros antiguos de este mismo nodo; registros de otros
 nodos se conservan.
@@ -381,8 +414,10 @@ nodos se conservan.
 
 - `depends_on` solo controla el **orden de creación**, no que el servicio esté
   **listo** (`depends_on: [mongo]` no implica que Mongo ya acepte queries). La
-  forma correcta de expresar "B necesita a A *listo*" es el **healthcheck**, que
-  ya tiene cada servicio; el Makefile lo aprovecha con `--wait`.
+  forma correcta de expresar "B necesita a A *listo*" es el **healthcheck**; el
+  Makefile lo aprovecha con `--wait` donde existe, y con el estado `passing` de
+  Consul donde no (`extract` corre en una imagen sin shell y no define
+  `HEALTHCHECK`).
 - El orden por fases es **explícito y auditable** (se ve la secuencia en la
   salida de `make up`) y no acopla el `compose.yaml` a una topología de arranque
   que el provider Docker resuelve igual en runtime.
@@ -434,7 +469,9 @@ cp .env.example .env
 
 - `deploy/.env` es **bootstrap**: dirección/CA/tokens de Consul y parámetros de infraestructura.
 - `CONSUL_ENABLED` es variable de entorno fijada a `"true"` en `compose.yaml`; no va en `.env` ni en KV.
-- Las URLs E-W/health del orquestador se siembran en KV desde `deploy/kv/orchestrator.env` con `make kv-seed` (usa `docker exec` + `CONSUL_ORCHESTRATOR_TOKEN`).
+- La configuración funcional de los 4 servicios se siembra en Consul KV desde `deploy/kv/<servicio>.env` (`orchestrator`, `extract`, `persistence`, `auditlog`) con `make kv-seed` (usa `docker exec` + `CONSUL_KV_SEED_TOKEN`, un token dedicado con `key:write` sólo bajo `pdf-extractext/dev/`).
+- `make kv-seed` es idempotente y no destructivo: escribe clave por clave y no borra claves existentes. Sembrar es obligatorio porque un prefijo ausente (HTTP 404) es error fatal de arranque en los 4 servicios; persistence además rechaza un prefijo vacío.
+- Los tokens de API (`PERSISTENCE_API_TOKEN`, `AUDIT_LOG_API_TOKEN`, `SERVICE_API_TOKEN`) **no** se siembran: son secretos y viven en el entorno de compose (fallback) o en el KV ya cargado.
 - Consul debe estar corriendo en `backend` con `container_name: consul`. Su UI/API se publica **sólo en loopback** (`127.0.0.1:8501`), nunca en `0.0.0.0` ni por Traefik. Levántalo desde `/home/francocp12/Documents/Services/consul`; `make check-consul` valida esa regla y `make consul-ui` muestra la URL y el CA.
 - El `.gitignore` excluye `.env`: **nunca** se commitean tokens.
 
@@ -442,27 +479,33 @@ cp .env.example .env
 
 ```bash
 make certs
-make kv-seed       # requiere Consul arriba en backend
+make kv-seed       # siembra los 4 prefijos; requiere Consul arriba en backend
 make deploy        # build + arranque por fases + espera healthy (primera vez)
 make up            # arranque por fases sin rebuild (uso habitual)
 make ps            # estado de los contenedores
 ```
 
-`make up` levanta en fases esperando el `healthy` de cada una:
+`make up` levanta en fases esperando el `healthy` de cada una y, antes de la
+entrada, el `passing` de Consul:
 
 ```
->> [1/5] mongo
->> [2/5] traefik-public, traefik-internal
->> [3/5] extract, persistence, auditlog
->> [4/5] seed KV + orchestrator (--force-recreate para recargar KV)
->> [5/5] Consul: reconciliando registros
+>> [1/6] mongo
+>> [2/6] traefik-public, traefik-internal
+>> [3/6] seed KV (4 prefijos) + extract, persistence, auditlog
+>> [4/6] Consul: esperando a que los servicios de negocio estén passing
+>> [5/6] orchestrator (entrada; relee KV con --force-recreate)
+>> [6/6] Consul: reconciliando registros
 ```
 
 Qué pasa por dentro:
 
-- Se construyen/levantan los 6 servicios; Traefik publica `80`/`443`, el resto
-  no publica nada.
+- Se construyen/levantan los 6 servicios; Traefik publica `80`/`443`, mongo
+  publica `27017` sólo en loopback (`127.0.0.1`) y el resto no publica nada.
+- La fase 3 siembra los 4 prefijos KV y recién después levanta
+  `extract`, `persistence` y `auditlog`, que leen su configuración al arrancar.
 - Los MS se registran en Consul y Traefik los descubre mediante `consulCatalog`.
+  La fase 4 espera a que ese registro esté `passing` para las tres dependencias
+  del orquestador (ver §4.5); `make wait-consul` expone la espera por separado.
 - Al terminar el arranque, se eliminan los IDs viejos de servicios del nodo
   Consul usado por este deploy, incluidos stubs de pruebas que hayan quedado.
 - `CONSUL_HTTP_ADDR`, los tokens ACL y la ruta de la CA son bootstrap y quedan
@@ -528,7 +571,12 @@ Resultados medidos / esperados:
 docker network inspect pdf-extractext_backend | grep -i internal   # → "internal": true
 docker inspect pdf-extractext-extract-1 \
   --format '{{json .NetworkSettings.Ports}}'                        # → {} (sin publicar)
+docker inspect pdf-extractext-mongo-1 \
+  --format '{{json .HostConfig.PortBindings}}'                      # → 27017 sólo en 127.0.0.1
 ```
+
+Mongo desde el host (Compass): `mongodb://127.0.0.1:27017` — el puerto se
+publica **sólo en loopback** (D12.5).
 
 ### 7.1 Batería de tests automatizada (`make test`)
 
@@ -549,7 +597,7 @@ make test-consul-lifecycle # baja graceful y purga crítica en Consul
 | Target | Script | Qué prueba | Cobertura de servicios |
 | ------ | ------ | ---------- | ---------------------- |
 | `test-operational` | `tests/01-operational.sh` | **Operatividad de punta a punta**: salud de todo el stack, réplicas de extract, borde N-S (301/404/415/cabeceras), extracción real (checksum == SHA-256), persistencia (escritura/lectura + dedup), CRUD de textos, auditoría y datos en Mongo | **todos**: traefik, orchestrator, extract×5, persistence, auditlog, mongo |
-| `test-network` | `tests/02-network.sh` | Red `backend` `internal:true`; MS sólo en backend; **sólo Traefik publica**; host no alcanza los MS; `no-new-privileges`, `cap_drop ALL`, `read_only`, sin `docker.sock` (descubrimiento vía Consul) | infra |
+| `test-network` | `tests/02-network.sh` | Red `backend` `internal:true`; MS sólo en backend; **sólo Traefik publica en la red** (excepciones explícitas en loopback: mongo `127.0.0.1:27017` para Compass, Consul `127.0.0.1:8501`); host no alcanza los MS; `no-new-privileges`, `cap_drop ALL`, `read_only`, sin `docker.sock` (descubrimiento vía Consul) | infra |
 | `test-ratelimit` | `tests/03-rate-limit.sh` | Ráfaga con `vegeta` por encima de `average 50/s` ⇒ aparecen `429` y respuestas permitidas | traefik (borde) |
 | `test-cb` | `tests/04-circuit-breaker.sh` | Con un backend presente que **siempre falla** (stub): 1º `502`, luego el breaker abre ⇒ `503`; al restaurar ⇒ `200` | traefik E-W + extract |
 | `test-retry` | `tests/05-retry.sh` | Extract: POST con un retry; Persistence: GET con un retry y POST sin retry | traefik E-W |
@@ -771,7 +819,10 @@ Aplicado en `compose.yaml`:
 
 - **Red `backend` `internal: true`** — los MS no salen a Internet ni son
   alcanzables desde el host. Verificable con `docker network inspect`.
-- **Solo Traefik publica** `80`/`443`. El resto **no** tiene `ports:`.
+- **Solo Traefik publica en la red** `80`/`443`. Mongo publica `27017` **sólo
+  en loopback** (`127.0.0.1:27017:27017` en el compose, para Compass), vía el
+  puente no interno `mongo-local` que sólo mongo usa; Consul hace lo propio
+  con su UI/API (`127.0.0.1:8501`). El resto **no** tiene `ports:`.
 - **Mounts `:ro`** — `traefik.yml`, `entrypoint.sh`, `dynamic.yml`, `certs/` y
   la CA de Consul se montan read-only: Traefik solo los lee. El socket de Docker
   **no** se monta: el descubrimiento es vía Consul Catalog.

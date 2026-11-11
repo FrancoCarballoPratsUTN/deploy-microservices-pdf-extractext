@@ -11,13 +11,15 @@
 # Orden de arranque (`up`): NO se usa depends_on.
 #   1. mongo
 #   2. traefik-public, traefik-internal
-#   3. extract, persistence, auditlog
-#   4. kv-seed (URLs del orquestador en KV) + orchestrator
+#   3. kv-seed (4 prefijos) + extract, persistence, auditlog
+#   4. espera a que Consul los reporte `passing` (enrutables por Traefik)
+#   5. orchestrator (relee KV)
+#   6. reconciliación de registros obsoletos en Consul
 #
 # Uso típico:
 #   make network       # crea pdf-extractext_backend (internal) si no existe
 #   make certs         # TLS de desarrollo
-#   make kv-seed       # carga deploy/kv/* en Consul (requiere consul arriba)
+#   make kv-seed       # siembra deploy/kv/*.env en Consul (requiere consul arriba)
 #   make deploy        # build + arranque ordenado + reconciliación
 #   make test          # corre toda la batería
 #
@@ -29,11 +31,13 @@ BACKEND_NETWORK ?= pdf-extractext_backend
 CONSUL_CONTAINER ?= consul
 CONSUL_LOCAL_CA ?= /consul/config/tls/consul-ca.pem
 CONSUL_LOCAL_URL ?= https://127.0.0.1:8501
+# Servicios que deben estar `passing` en Consul antes de arrancar el orquestador.
+CONSUL_WAIT_SERVICES ?= extract persistence auditlog
 
 -include .env
 
 .DEFAULT_GOAL := help
-.PHONY: help network check-consul consul-ui certs kv-seed deploy up build down clean \
+.PHONY: help network check-consul consul-ui wait-consul certs kv-seed deploy up build down clean \
         restart ps logs urls \
         test test-operational test-network test-ratelimit test-cb test-retry \
         test-consul-lifecycle test-health
@@ -70,39 +74,54 @@ consul-ui: ## Muestra la URL y el CA para entrar a la UI de Consul
 	@echo "  CA a confiar en el navegador: $(CONSUL_CA_FILE)"
 	@echo "  Login con el management token (CONSUL_INITIAL_MANAGEMENT_TOKEN)."
 
-kv-seed: check-consul ## Carga deploy/kv/* en Consul KV (CONSUL_ENABLED es env, no KV)
-	@if [ -z "$(CONSUL_ORCHESTRATOR_TOKEN)" ]; then \
-	  echo "ERROR: CONSUL_ORCHESTRATOR_TOKEN es requerido (deploy/.env)" >&2; exit 1; \
+wait-consul: ## Espera a que los servicios estén `passing` en Consul
+	@WAIT_TIMEOUT=$(WAIT_TIMEOUT) ./scripts/wait-consul-passing.sh $(CONSUL_WAIT_SERVICES)
+
+kv-seed: check-consul ## Carga deploy/kv/*.env en Consul KV (un prefijo por servicio)
+	@if [ -z "$(CONSUL_KV_SEED_TOKEN)" ]; then \
+	  echo "ERROR: CONSUL_KV_SEED_TOKEN es requerido (token con key:write bajo el prefijo raíz)" >&2; exit 1; \
 	fi
-	@prefix="$${CONSUL_ORCHESTRATOR_KV_PREFIX:-pdf-extractext/dev/orchestrator}"; \
-	echo ">> Seeding Consul KV ($$prefix)"; \
-	while IFS='=' read -r key value || [ -n "$$key" ]; do \
-	  case "$$key" in ''|\#*) continue;; esac; \
-	  if ! printf '%s' "$$value" | docker exec -i \
-	    -e CONSUL_HTTP_TOKEN="$(CONSUL_ORCHESTRATOR_TOKEN)" \
-	    -e CONSUL_HTTP_ADDR="$(CONSUL_LOCAL_URL)" \
-	    -e CONSUL_CACERT="$(CONSUL_LOCAL_CA)" \
-	    $(CONSUL_CONTAINER) consul kv put "$$prefix/$$key" - >/dev/null 2>&1; then \
-	    echo "ERROR: kv put $$prefix/$$key failed (403? check Consul ACL key:write)" >&2; exit 1; \
+	@set -euo pipefail; \
+	seed() { \
+	  local service="$$1" prefix="$$2" file="kv/$$1.env" key value; \
+	  if [ ! -f "$$file" ]; then \
+	    echo "ERROR: falta $$file" >&2; return 1; \
 	  fi; \
-	  echo "   kv put $$prefix/$$key"; \
-	done < kv/orchestrator.env
-	@echo ">> KV seeded"
+	  echo ">> Seeding $$prefix ($$file)"; \
+	  while IFS='=' read -r key value || [ -n "$$key" ]; do \
+	    case "$$key" in ''|\#*) continue;; esac; \
+	    if ! printf '%s' "$$value" | docker exec -i \
+	      -e CONSUL_HTTP_TOKEN="$(CONSUL_KV_SEED_TOKEN)" \
+	      -e CONSUL_HTTP_ADDR="$(CONSUL_LOCAL_URL)" \
+	      -e CONSUL_CACERT="$(CONSUL_LOCAL_CA)" \
+	      $(CONSUL_CONTAINER) consul kv put "$$prefix/$$key" - >/dev/null 2>&1; then \
+	      echo "ERROR: kv put $$prefix/$$key failed (403? falta key:write en el token de seed)" >&2; return 1; \
+	    fi; \
+	    echo "   kv put $$prefix/$$key"; \
+	  done < "$$file"; \
+	}; \
+	seed orchestrator "$(or $(CONSUL_ORCHESTRATOR_KV_PREFIX),pdf-extractext/dev/orchestrator)"; \
+	seed extract      "$(or $(CONSUL_EXTRACT_KV_PREFIX),pdf-extractext/dev/extract)"; \
+	seed persistence  "$(or $(CONSUL_PERSISTENCE_KV_PREFIX),pdf-extractext/dev/persistence)"; \
+	seed auditlog     "$(or $(CONSUL_AUDIT_KV_PREFIX),pdf-extractext/dev/auditlog)"
+	@echo ">> KV seeded: 4 prefijos"
 
 certs: ## Genera los certificados TLS de desarrollo (mkcert)
 	./certs/generate-certs.sh
 
 up: network check-consul ## Arranque ORDENADO por fases + KV seed + espera healthy
-	@echo ">> [1/5] mongo (backing store)"
+	@echo ">> [1/6] mongo (backing store)"
 	@$(COMPOSE) up -d --wait --wait-timeout $(WAIT_TIMEOUT) mongo
-	@echo ">> [2/5] traefik-public, traefik-internal (borde N-S / E-W)"
+	@echo ">> [2/6] traefik-public, traefik-internal (borde N-S / E-W)"
 	@$(COMPOSE) up -d --wait --wait-timeout $(WAIT_TIMEOUT) traefik-public traefik-internal
-	@echo ">> [3/5] extract, persistence, auditlog (servicios de negocio)"
-	@$(COMPOSE) up -d --wait --wait-timeout $(WAIT_TIMEOUT) extract persistence auditlog
-	@echo ">> [4/5] seed KV + orchestrator (entrada)"
+	@echo ">> [3/6] seed KV (4 prefijos) + extract, persistence, auditlog"
 	@$(MAKE) --no-print-directory kv-seed
+	@$(COMPOSE) up -d --wait --wait-timeout $(WAIT_TIMEOUT) extract persistence auditlog
+	@echo ">> [4/6] Consul: esperando a que los servicios de negocio estén passing"
+	@WAIT_TIMEOUT=$(WAIT_TIMEOUT) ./scripts/wait-consul-passing.sh $(CONSUL_WAIT_SERVICES)
+	@echo ">> [5/6] orchestrator (entrada; relee KV con --force-recreate)"
 	@$(COMPOSE) up -d --force-recreate --wait --wait-timeout $(WAIT_TIMEOUT) orchestrator
-	@echo ">> [5/5] Consul: reconciliando registros con los contenedores actuales"
+	@echo ">> [6/6] Consul: reconciliando registros con los contenedores actuales"
 	@./scripts/reconcile-consul-services.sh
 	@echo ">> stack arriba y healthy"
 
