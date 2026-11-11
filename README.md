@@ -715,9 +715,10 @@ devuelve `502` las primeras `N` peticiones y luego `200`.
 un replay tras una escritura confirmada devuelve `409` en vez de la respuesta
 original. Extract sí admite replay porque la extracción no crea ese registro.
 
-Los dos middlewares hacen un único retry para `502-504`, con backoff corto.
-Extract habilita el replay de POST y limita el cuerpo a 16 MiB para aceptar PDF
-de hasta 15 MiB. Persistence mantiene deshabilitado el replay de POST/PATCH/LOCK;
+Los dos middlewares hacen un único retry para `502-504`, con backoff exponencial
+corto (`initialInterval` es la base; Traefik aplica además jitter). Extract
+habilita el replay de POST y limita el cuerpo a 16 MiB para aceptar PDF de hasta
+15 MiB. Persistence mantiene deshabilitado el replay de POST/PATCH/LOCK;
 Audit no tiene retry. El circuit breaker va antes que el retry: cuando está
 abierto, devuelve `503` sin volver al backend.
 
@@ -725,9 +726,9 @@ abierto, devuelve `503` sin volver al backend.
 
 ## 9. Fase 12: salud y configuración del orquestador
 
-La política de retry vive en Traefik. El orquestador configura una sola llamada
-por operación (`RETRY_MAX_ATTEMPTS=1` en su prefijo de Consul KV), para evitar
-que los intentos se multipliquen entre capas.
+La política de retry vive **sólo en Traefik**. El orquestador no implementa
+reintentos: hace una única llamada por operación, así que los intentos no se
+multiplican entre capas. No hay claves `RETRY_*` en su prefijo de Consul KV.
 
 ### 9.1 Salud agregada (`/readyz`)
 
@@ -744,11 +745,12 @@ que los intentos se multipliquen entre capas.
 
 ### 9.2 Presupuesto de retry
 
-El orquestador carga configuración funcional desde Consul KV al arrancar. En el
-prefijo indicado por `CONSUL_ORCHESTRATOR_KV_PREFIX`, configurar
-`RETRY_MAX_ATTEMPTS=1` para desactivar sus reintentos. Las variables de entorno
-de Compose son fallback para el modo local sin Consul y no sustituyen ese valor
-en despliegue.
+El orquestador no tiene presupuesto de retry propio: su código no lee claves
+`RETRY_*` y cada operación se ejecuta con una sola llamada. Todo el retry E-W
+está en Traefik (`extract-retry` y `persistence-retry`), con `attempts: 2` para
+`502-504`, `initialInterval` de `200ms`/`100ms` y backoff exponencial con jitter
+(implementación de Traefik sobre `cenkalti/backoff`). El circuit breaker queda
+antes del retry, de modo que un breaker abierto responde `503` sin reintentar.
 
 ### 9.3 Trazabilidad y observabilidad
 
@@ -771,7 +773,8 @@ El `compose.yaml` del orquestador ahora inyecta:
 - `PERSISTENCE_HEALTH_URL` (default: `http://persistence:8000/readyz`)
 - `AUDIT_LOG_HEALTH_URL` (default: `http://auditlog:8000/readyz`)
 - `HEALTH_CHECK_TIMEOUT` (default: `2s`)
-- `RETRY_MAX_ATTEMPTS` (en Consul KV; debe ser `1` cuando Traefik reintenta)
+
+El orquestador no define variables `RETRY_*`: el retry vive sólo en Traefik.
 
 **Healthcheck del contenedor** pasa a `wget -qO- http://127.0.0.1:8080/readyz` (antes `/healthz`). Esto asegura que el orquestador solo se marque `healthy` cuando **todos** sus dependientes estén listos.
 

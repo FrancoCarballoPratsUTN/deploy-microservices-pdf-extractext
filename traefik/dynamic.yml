@@ -31,6 +31,8 @@ http:
 
     # Dos intentos totales (uno inicial y un retry) para fallos transitorios.
     # El breaker queda antes (más externo): cuando abre, evita llegar al retry.
+    # `initialInterval` es la base del backoff exponencial de Traefik
+    # (cenkalti/backoff con jitter ±50%); no es una espera lineal.
     # Extract recibe PDFs de hasta 15 MiB; 16 MiB deja margen para reproducirlos.
     extract-retry:
       retry:
@@ -44,6 +46,7 @@ http:
 
     # Por defecto Traefik no reintenta POST/PATCH/LOCK; GET, PUT y DELETE sí.
     # Así POST /texts conserva su 409 ante checksum existente.
+    # Mismo backoff exponencial con jitter que `extract-retry`, base 100ms.
     persistence-retry:
       retry:
         attempts: 2
